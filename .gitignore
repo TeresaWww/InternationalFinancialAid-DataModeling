@@ -1,5 +1,5 @@
 # Data files
-data/
+data/*.xlsx
 *.xlsx
 *.zip
 
