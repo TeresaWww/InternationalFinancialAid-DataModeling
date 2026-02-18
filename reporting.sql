@@ -7,7 +7,6 @@ IF OBJECT_ID('tempdb..#AidDistributionCube') IS NOT NULL
 
 -- Query 1: Aid Distribution Cube
 -- Analyze total aid distribution by country across all sectors and years since 2020.
-
 SELECT
     COALESCE(c.Country_Name, 'ALL COUNTRIES') AS Country,
     COALESCE(s.Sub_Sector_Name, 'ALL SECTORS') AS Sector,
@@ -22,15 +21,20 @@ SELECT
     GROUPING(CAST(f.Time_Key / 10 AS INT)) AS Year_Subtotal
 INTO #AidDistributionCube
 FROM fact_aid_transactions f
-    INNER JOIN dim_recipient_org ro 
+    INNER JOIN dim_recipient_org ro
         ON f.Recipient_Org_Key = ro.Recipient_Org_Key
-    INNER JOIN dim_recipient_country c 
+    INNER JOIN dim_recipient_country c
         ON ro.Recipient_Country_Key = c.Recipient_Country_Key
-    INNER JOIN dim_sub_sector s 
+    INNER JOIN dim_sub_sector s
         ON f.Sub_Sector_Key = s.Sub_Sector_Key
+    INNER JOIN dim_time t
+        ON f.Time_Key = t.Time_Key
+    INNER JOIN dim_transaction_type tt
+        ON f.Transaction_Type_Key = tt.Transaction_Type_Key
 WHERE
     f.Value_USD IS NOT NULL
     AND CAST(f.Time_Key / 10 AS INT) >= 2020
+    AND tt.Transaction_Type IN ('3 - Disbursement', '4 - Expenditure')
 GROUP BY
     CUBE(c.Country_Name, s.Sub_Sector_Name, CAST(f.Time_Key / 10 AS INT));
 
@@ -46,7 +50,6 @@ WHERE
     AND Year_Subtotal = 1
     AND Country_Subtotal = 0
 ORDER BY Total_Aid_USD DESC;
-
 
 
 
@@ -88,38 +91,35 @@ RankedSectors AS (
     FROM SectorAidSummary
 )
 
-SELECT
+SELECT TOP 10
     Sector_Category,
     Sub_Sector_Name,
     Calendar_Year AS Year,
 
-    FORMAT(Total_Aid_USD, 'C0') AS Total_Aid,
-    FORMAT(Transaction_Count, 'N0') AS Transactions,
+    Total_Aid_USD,
+    Transaction_Count,
 
     DENSE_RANK() OVER (
         PARTITION BY Calendar_Year
         ORDER BY Total_Aid_USD DESC
     ) AS Sector_Rank,
 
-    FORMAT(
-        Total_Aid_USD * 100.0 
-        / SUM(Total_Aid_USD) OVER (PARTITION BY Calendar_Year),
-        'N2'
-    ) + '%' AS Percent_of_Total_Aid,
+    -- numeric percent for Excel charts
+    Total_Aid_USD * 1.0 
+        / SUM(Total_Aid_USD) OVER (PARTITION BY Calendar_Year)
+        AS Percent_of_Total_Aid,
 
-    FORMAT(
-        PERCENT_RANK() OVER (
-            PARTITION BY Calendar_Year
-            ORDER BY Total_Aid_USD
-        ),
-        'P2'
+    PERCENT_RANK() OVER (
+        PARTITION BY Calendar_Year
+        ORDER BY Total_Aid_USD
     ) AS Percentile_Rank,
 
-    FORMAT(Avg_Transaction_USD, 'C0') AS Avg_Transaction_Size
+    Avg_Transaction_USD
 
 FROM RankedSectors
 WHERE Total_Aid_USD >= Percentile_85_Threshold
 ORDER BY Calendar_Year DESC, Total_Aid_USD DESC;
+
 
 
 
@@ -196,7 +196,7 @@ DonorWithComparisons AS (
     WHERE Total_Contribution_USD > 1000000
 )
 
-SELECT TOP 30
+SELECT
     UPPER(LEFT(Provider_Org, 50)) AS Donor_Organization,
     Org_Type,
     Calendar_Year AS Year,
@@ -235,105 +235,106 @@ ORDER BY Donor_Rank, Total_Contribution_USD DESC;
 
 
 
-
--- Query 4: Aid Flow Trends with Moving Averages
-USE financial_aid_db;
-GO
-
+-- Query 4 
 IF OBJECT_ID('tempdb..#QuarterlyAidFlows') IS NOT NULL
     DROP TABLE #QuarterlyAidFlows;
 
-
-WITH QuarterlyBase AS (
-    SELECT
-        CAST(f.Time_Key / 10 AS INT) AS Calendar_Year,
-        CAST(f.Time_Key % 10 AS INT) AS Quarter_Number,
-
-        COUNT(DISTINCT f.Aid_Fact_Key) AS Transactions,
-        SUM(f.Value_USD) AS Total_Aid_USD,
-        AVG(f.Value_USD) AS Avg_Transaction_USD,
-        COUNT(DISTINCT ro.Recipient_Country_Key) AS Countries_Receiving_Aid
-
-    FROM fact_aid_transactions f
-        INNER JOIN dim_recipient_org ro 
-            ON f.Recipient_Org_Key = ro.Recipient_Org_Key
-
-    WHERE
-        f.Value_USD > 0
-        AND CAST(f.Time_Key / 10 AS INT) >= 2020
-
-    GROUP BY
-        CAST(f.Time_Key / 10 AS INT),
-        CAST(f.Time_Key % 10 AS INT)
-)
-
 SELECT
-    Calendar_Year,
-    CONCAT('Q', Quarter_Number) AS Calendar_Quarter,
-    CONCAT(Calendar_Year, '-Q', Quarter_Number) AS Year_Quarter,
-    (Calendar_Year * 4) + Quarter_Number AS Quarter_Index,
-
-    Transactions,
-    Total_Aid_USD,
-    Avg_Transaction_USD,
-    Countries_Receiving_Aid,
-
-    -- 4-quarter moving average
-    AVG(Total_Aid_USD) OVER (
-        ORDER BY Calendar_Year, Quarter_Number
+    t.Calendar_Year,
+    t.Calendar_Quarter,
+    CONCAT(t.Calendar_Year, '-', t.Calendar_Quarter) AS Year_Quarter,
+    (t.Calendar_Year * 4) +
+        CASE t.Calendar_Quarter
+            WHEN 'Q1' THEN 1
+            WHEN 'Q2' THEN 2
+            WHEN 'Q3' THEN 3
+            WHEN 'Q4' THEN 4
+        END AS Quarter_Number,
+    COUNT(DISTINCT f.Aid_Fact_Key) AS Transactions,
+    SUM(f.Value_USD) AS Total_Aid_USD,
+    AVG(f.Value_USD) AS Avg_Transaction_USD,
+    COUNT(DISTINCT ro.Recipient_Country_Key) AS Countries_Receiving_Aid,
+    AVG(SUM(f.Value_USD)) OVER (
+        ORDER BY t.Calendar_Year, t.Calendar_Quarter
         ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
     ) AS Moving_Avg_4Q,
-
-    -- 8-quarter moving average
-    AVG(Total_Aid_USD) OVER (
-        ORDER BY Calendar_Year, Quarter_Number
+    AVG(SUM(f.Value_USD)) OVER (
+        ORDER BY t.Calendar_Year, t.Calendar_Quarter
         ROWS BETWEEN 7 PRECEDING AND CURRENT ROW
     ) AS Moving_Avg_8Q,
-
-    -- Previous quarter value
-    LAG(Total_Aid_USD, 1) OVER (
-        ORDER BY Calendar_Year, Quarter_Number
+    LAG(SUM(f.Value_USD), 1) OVER (
+        ORDER BY t.Calendar_Year, t.Calendar_Quarter
     ) AS Previous_Quarter_Aid
-
 INTO #QuarterlyAidFlows
-FROM QuarterlyBase;
+FROM fact_aid_transactions f
+    INNER JOIN dim_time t ON f.Time_Key = t.Time_Key
+    INNER JOIN dim_recipient_org ro ON f.Recipient_Org_Key = ro.Recipient_Org_Key
+    INNER JOIN dim_transaction_type tt ON f.Transaction_Type_Key = tt.Transaction_Type_Key
+WHERE
+    f.Value_USD > 0
+    AND t.Calendar_Year >= 2020
+    AND tt.Transaction_Type IN ('3 - Disbursement', '4 - Expenditure')
+GROUP BY
+    t.Calendar_Year,
+    t.Calendar_Quarter
+HAVING
+    SUM(f.Value_USD) > 0;
 
-
+-- Query results with trend analysis
 SELECT
     Year_Quarter,
     FORMAT(Total_Aid_USD, 'C0') AS Total_Aid,
     FORMAT(Transactions, 'N0') AS Transaction_Count,
     FORMAT(Avg_Transaction_USD, 'C0') AS Avg_Transaction,
     Countries_Receiving_Aid,
-
-    FORMAT(Moving_Avg_4Q, 'C0') AS [4Q_Moving_Avg],
-    FORMAT(Moving_Avg_8Q, 'C0') AS [8Q_Moving_Avg],
-
+    FORMAT(Moving_Avg_4Q, 'C0') AS [4_Quarter_Moving_Avg],
+    FORMAT(Moving_Avg_8Q, 'C0') AS [8_Quarter_Moving_Avg],
     CASE
-        WHEN Previous_Quarter_Aid IS NOT NULL 
-             AND Previous_Quarter_Aid > 0
-        THEN FORMAT(
-                (Total_Aid_USD - Previous_Quarter_Aid)
-                * 100.0 / Previous_Quarter_Aid,
+        WHEN Previous_Quarter_Aid IS NOT NULL AND Previous_Quarter_Aid > 0 THEN
+            FORMAT(
+                (Total_Aid_USD - Previous_Quarter_Aid) * 100.0 / Previous_Quarter_Aid,
                 'N1'
-             ) + '%'
+            ) + '%'
         ELSE 'N/A'
     END AS QoQ_Growth,
-
+    CASE
+        WHEN Moving_Avg_4Q > 0 THEN
+            FORMAT(
+                (Total_Aid_USD - Moving_Avg_4Q) * 100.0 / Moving_Avg_4Q,
+                'N1'
+            ) + '%'
+        ELSE 'N/A'
+    END AS Deviation_from_Trend,
     CASE
         WHEN Total_Aid_USD > Moving_Avg_4Q * 1.1 THEN 'Above Trend'
         WHEN Total_Aid_USD < Moving_Avg_4Q * 0.9 THEN 'Below Trend'
         ELSE 'On Trend'
     END AS Trend_Status
-
 FROM #QuarterlyAidFlows
-WHERE Quarter_Index >= (
-    SELECT MIN(Quarter_Index) + 3 
-    FROM #QuarterlyAidFlows
-)
-ORDER BY Quarter_Index DESC;
+WHERE
+    Quarter_Number >= (SELECT MIN(Quarter_Number) + 3 FROM #QuarterlyAidFlows)
+ORDER BY
+    Quarter_Number DESC;
 
-
-SELECT DISTINCT TOP 50 Time_Key
-FROM fact_aid_transactions
-ORDER BY Time_Key DESC;
+-- Additional analysis: Identify seasonal patterns
+SELECT
+    Calendar_Quarter AS Quarter,
+    COUNT(*) AS Quarter_Count,
+    FORMAT(AVG(Total_Aid_USD), 'C0') AS Avg_Quarterly_Aid,
+    FORMAT(MIN(Total_Aid_USD), 'C0') AS Min_Quarterly_Aid,
+    FORMAT(MAX(Total_Aid_USD), 'C0') AS Max_Quarterly_Aid,
+    FORMAT(STDEV(Total_Aid_USD), 'C0') AS Std_Deviation,
+    -- Coefficient of variation (volatility measure)
+    FORMAT(
+        STDEV(Total_Aid_USD) * 100.0 / AVG(Total_Aid_USD),
+        'N1'
+    ) + '%' AS Coefficient_of_Variation
+FROM #QuarterlyAidFlows
+GROUP BY Calendar_Quarter
+ORDER BY
+    CASE Calendar_Quarter
+        WHEN 'Q1' THEN 1
+        WHEN 'Q2' THEN 2
+        WHEN 'Q3' THEN 3
+        WHEN 'Q4' THEN 4
+    END;
